@@ -21,41 +21,52 @@ require('dotenv').config();
 
 const app = express();
 const PORT = process.env.PORT || 3001;
-const JWT_SECRET = process.env.JWT_SECRET || 'sge-secret-key-2024';
-const DB_PATH = path.join(__dirname, 'data', 'sge.db');
 
-// Configuración de Winston
+// Configuración crítica para Railway
+const JWT_SECRET = process.env.JWT_SECRET || 'fallback-secret-temp'; // Solo para desarrollo
+const NODE_ENV = process.env.NODE_ENV || 'development';
+const IS_RAILWAY = process.env.RAILWAY_ENVIRONMENT !== undefined || NODE_ENV === 'production';
+
+// Base de datos: SQLite local para desarrollo, memoria para Railway
+let DB_PATH;
+
+if (IS_RAILWAY) {
+    // En Railway usar base de datos en memoria (temporal)
+    console.warn(' Railway detectado - usando base de datos en memoria');
+    DB_PATH = ':memory:';
+} else {
+    // En local usar archivo
+    DB_PATH = path.join(__dirname, 'data', 'sge.db');
+}
+
+// Configuración de Winston adaptada para producción
 const logger = winston.createLogger({
-    level: 'info',
+    level: IS_RAILWAY ? 'info' : 'debug',
     format: winston.format.combine(
         winston.format.timestamp(),
         winston.format.errors({ stack: true }),
-        winston.format.json()
+        IS_RAILWAY ? winston.format.json() : winston.format.simple()
     ),
-    defaultMeta: { service: 'sge-api' },
+    defaultMeta: { service: 'sge-api', environment: NODE_ENV },
     transports: [
-        new winston.transports.File({ filename: 'logs/error.log', level: 'error' }),
-        new winston.transports.File({ filename: 'logs/combined.log' }),
+        // Solo logs en consola para Railway (evita filesystem)
         new winston.transports.Console({
-            format: winston.format.simple()
+            format: winston.format.combine(
+                winston.format.colorize(),
+                winston.format.simple()
+            )
         })
     ]
 });
 
-// Crear directorio de datos si no existe
-const dataDir = path.dirname(DB_PATH);
-
-// Asegurar que fs.existsSync y fs.mkdirSync estén disponibles
-if (typeof fs.existsSync === 'function' && typeof fs.mkdirSync === 'function') {
-    if (!fs.existsSync(dataDir)) {
-        fs.mkdirSync(dataDir, { recursive: true });
-    }
-} else {
-    // Fallback: intentar con require('fs').promises o crear directorio con try-catch
+// Solo crear directorios en desarrollo local
+if (!IS_RAILWAY) {
     try {
-        const fsSync = require('fs');
-        if (!fsSync.existsSync(dataDir)) {
-            fsSync.mkdirSync(dataDir, { recursive: true });
+        const dataDir = path.dirname(DB_PATH);
+        if (typeof fs.existsSync === 'function' && typeof fs.mkdirSync === 'function') {
+            if (!fs.existsSync(dataDir)) {
+                fs.mkdirSync(dataDir, { recursive: true });
+            }
         }
     } catch (err) {
         console.warn('No se pudo crear directorio de datos:', err.message);
@@ -182,11 +193,29 @@ const authenticateToken = (req, res, next) => {
     });
 };
 
-// Middleware de logging de requests
+// Middleware de logging de requests mejorado
 app.use((req, res, next) => {
+    const timestamp = new Date().toISOString();
     logger.info(`${req.method} ${req.path}`, { 
-        ip: req.ip, 
-        userAgent: req.get('User-Agent') 
+        ip: req.ip,
+        userAgent: req.get('User-Agent'),
+        timestamp,
+        environment: NODE_ENV
+    });
+    next();
+});
+
+// Middleware para capturar errores asíncronos
+app.use((req, res, next) => {
+    res.on('finish', () => {
+        if (res.statusCode >= 400) {
+            logger.warn(`HTTP ${res.statusCode} - ${req.method} ${req.path}`, {
+                statusCode: res.statusCode,
+                method: req.method,
+                path: req.path,
+                ip: req.ip
+            });
+        }
     });
     next();
 });
@@ -993,15 +1022,60 @@ app.get('/api/health', (req, res) => {
     });
 });
 
-// Manejo de errores 404
+// Manejo de errores 404 mejorado
 app.use((req, res) => {
-    res.status(404).json({ error: 'Endpoint no encontrado' });
+    logger.warn('Endpoint no encontrado', {
+        method: req.method,
+        path: req.path,
+        ip: req.ip,
+        userAgent: req.get('User-Agent')
+    });
+    res.status(404).json({ 
+        error: 'Endpoint no encontrado',
+        path: req.path,
+        method: req.method
+    });
 });
 
-// Manejo de errores globales
+// Manejo de errores globales mejorado para producción
 app.use((err, req, res, next) => {
-    logger.error('Error no manejado:', err);
-    res.status(500).json({ error: 'Error interno del servidor' });
+    // Log completo del error
+    logger.error('Error no manejado:', {
+        message: err.message,
+        stack: err.stack,
+        method: req.method,
+        path: req.path,
+        ip: req.ip,
+        userAgent: req.get('User-Agent'),
+        body: req.body,
+        params: req.params,
+        query: req.query,
+        environment: NODE_ENV,
+        isRailway: IS_RAILWAY
+    });
+
+    // Respuesta diferenciada para producción vs desarrollo
+    if (IS_RAILWAY) {
+        // En producción: mensaje genérico pero con código de error
+        res.status(500).json({ 
+            error: 'Error interno del servidor',
+            code: 'INTERNAL_ERROR',
+            timestamp: new Date().toISOString(),
+            requestId: Math.random().toString(36).substr(2, 9)
+        });
+    } else {
+        // En desarrollo: mostrar detalles completos
+        res.status(500).json({ 
+            error: 'Error interno del servidor',
+            message: err.message,
+            stack: err.stack,
+            details: {
+                method: req.method,
+                path: req.path,
+                body: req.body
+            }
+        });
+    }
 });
 
 // Iniciar servidor
