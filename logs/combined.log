@@ -1,0 +1,13 @@
+{"level":"info","message":"Conectado a SQLite en:","service":"sge-api","timestamp":"2026-04-20T13:33:01.570Z"}
+{"level":"info","message":"Base de datos inicializada","service":"sge-api","timestamp":"2026-04-20T13:33:02.249Z"}
+{"level":"info","message":"🚀 API SGE corriendo en puerto 3001","service":"sge-api","timestamp":"2026-04-20T13:33:02.263Z"}
+{"level":"info","message":"📊 Base de datos: C:\\Users\\Danie\\OneDrive\\Desktop\\pruebin - copia\\api\\data\\sge.db","service":"sge-api","timestamp":"2026-04-20T13:33:02.263Z"}
+{"level":"info","message":"🌐 Ambiente: development","service":"sge-api","timestamp":"2026-04-20T13:33:02.264Z"}
+{"ip":"::1","level":"info","message":"GET /","service":"sge-api","timestamp":"2026-04-20T13:34:15.255Z","userAgent":"Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/145.0.0.0 Safari/537.36 OPR/129.0.0.0"}
+{"ip":"::1","level":"info","message":"GET /favicon.ico","service":"sge-api","timestamp":"2026-04-20T13:34:15.410Z","userAgent":"Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/145.0.0.0 Safari/537.36 OPR/129.0.0.0"}
+{"ip":"::1","level":"info","message":"GET /api/calificaciones","service":"sge-api","timestamp":"2026-04-20T13:34:20.638Z","userAgent":"Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/145.0.0.0 Safari/537.36 OPR/129.0.0.0"}
+{"level":"info","message":"Conectado a SQLite en:","service":"sge-api","timestamp":"2026-04-20T13:42:57.151Z"}
+{"level":"info","message":"Base de datos inicializada","service":"sge-api","timestamp":"2026-04-20T13:42:58.000Z"}
+{"level":"info","message":"🚀 API SGE corriendo en puerto 3001","service":"sge-api","timestamp":"2026-04-20T13:42:58.012Z"}
+{"level":"info","message":"📊 Base de datos: C:\\Users\\Danie\\OneDrive\\Desktop\\pruebin - copia\\api\\data\\sge.db","service":"sge-api","timestamp":"2026-04-20T13:42:58.012Z"}
+{"level":"info","message":"🌐 Ambiente: development","service":"sge-api","timestamp":"2026-04-20T13:42:58.012Z"}

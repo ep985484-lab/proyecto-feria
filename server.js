@@ -11,7 +11,7 @@ const jwt = require('jsonwebtoken');
 const joi = require('joi');
 const winston = require('winston');
 const path = require('path');
-const fs = require('fs').promises;
+const fs = require('fs');
 const Database = require('better-sqlite3');
 const { v4: uuidv4 } = require('uuid');
 const multer = require('multer');
@@ -44,8 +44,22 @@ const logger = winston.createLogger({
 
 // Crear directorio de datos si no existe
 const dataDir = path.dirname(DB_PATH);
-if (!fs.existsSync(dataDir)) {
-    fs.mkdir(dataDir, { recursive: true });
+
+// Asegurar que fs.existsSync y fs.mkdirSync estén disponibles
+if (typeof fs.existsSync === 'function' && typeof fs.mkdirSync === 'function') {
+    if (!fs.existsSync(dataDir)) {
+        fs.mkdirSync(dataDir, { recursive: true });
+    }
+} else {
+    // Fallback: intentar con require('fs').promises o crear directorio con try-catch
+    try {
+        const fsSync = require('fs');
+        if (!fsSync.existsSync(dataDir)) {
+            fsSync.mkdirSync(dataDir, { recursive: true });
+        }
+    } catch (err) {
+        console.warn('No se pudo crear directorio de datos:', err.message);
+    }
 }
 
 // Inicializar base de datos SQLite
@@ -90,7 +104,7 @@ const schemas = {
         username: joi.string().alphanum().min(3).max(20).required(),
         password: joi.string().min(6).max(100).required(),
         name: joi.string().min(2).max(50).required(),
-        role: joi.string().valid(['admin', 'direccion', 'docente', 'psicologa', 'cafeteria', 'comedor', 'enfermeria', 'odontologia', 'papeleria']).required()
+        role: joi.string().valid('admin', 'direccion', 'docente', 'psicologa', 'cafeteria', 'comedor', 'enfermeria', 'odontologia', 'papeleria').required()
     }),
     
     excuse: joi.object({
@@ -98,7 +112,7 @@ const schemas = {
         course: joi.string().min(1).max(30).required(),
         psychologistUsername: joi.string().required(),
         reason: joi.string().min(10).max(500).required(),
-        type: joi.string().valid(['medica', 'personal', 'familiar', 'otra']).required(),
+        type: joi.string().valid('medica', 'personal', 'familiar', 'otra').required(),
         professorUsername: joi.string().required()
     }),
     
