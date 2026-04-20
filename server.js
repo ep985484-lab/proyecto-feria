@@ -12,7 +12,7 @@ const joi = require('joi');
 const winston = require('winston');
 const path = require('path');
 const fs = require('fs');
-const Database = require('better-sqlite3');
+const sqlite3 = require('sqlite3').verbose();
 const { v4: uuidv4 } = require('uuid');
 const multer = require('multer');
 const moment = require('moment');
@@ -21,55 +21,96 @@ require('dotenv').config();
 
 const app = express();
 const PORT = process.env.PORT || 3001;
+const JWT_SECRET = process.env.JWT_SECRET || 'sge-secret-key-2024';
+const DB_PATH = path.join(__dirname, 'data', 'sge.db');
 
-// Configuración crítica para Railway
-const JWT_SECRET = process.env.JWT_SECRET || 'fallback-secret-temp'; // Solo para desarrollo
-const NODE_ENV = process.env.NODE_ENV || 'development';
-const IS_RAILWAY = process.env.RAILWAY_ENVIRONMENT !== undefined || NODE_ENV === 'production';
-
-// Base de datos: SQLite local para desarrollo, memoria para Railway
-let DB_PATH;
-
-if (IS_RAILWAY) {
-    // En Railway usar base de datos en memoria (temporal)
-    console.warn(' Railway detectado - usando base de datos en memoria');
-    DB_PATH = ':memory:';
-} else {
-    // En local usar archivo
-    DB_PATH = path.join(__dirname, 'data', 'sge.db');
-}
-
-// Configuración de Winston adaptada para producción
+// Configuración de Winston
 const logger = winston.createLogger({
-    level: IS_RAILWAY ? 'info' : 'debug',
+    level: 'info',
     format: winston.format.combine(
         winston.format.timestamp(),
         winston.format.errors({ stack: true }),
-        IS_RAILWAY ? winston.format.json() : winston.format.simple()
+        winston.format.json()
     ),
-    defaultMeta: { service: 'sge-api', environment: NODE_ENV },
+    defaultMeta: { service: 'sge-api' },
     transports: [
-        // Solo logs en consola para Railway (evita filesystem)
+        new winston.transports.File({ filename: 'logs/error.log', level: 'error' }),
+        new winston.transports.File({ filename: 'logs/combined.log' }),
         new winston.transports.Console({
-            format: winston.format.combine(
-                winston.format.colorize(),
-                winston.format.simple()
-            )
+            format: winston.format.simple()
         })
     ]
 });
 
-// Solo crear directorios en desarrollo local
-if (!IS_RAILWAY) {
-    try {
-        const dataDir = path.dirname(DB_PATH);
-        if (typeof fs.existsSync === 'function' && typeof fs.mkdirSync === 'function') {
-            if (!fs.existsSync(dataDir)) {
-                fs.mkdirSync(dataDir, { recursive: true });
+// Crear directorio de datos si no existe
+const dataDir = path.dirname(DB_PATH);
+
+if (!fs.existsSync(dataDir)) {
+    fs.mkdirSync(dataDir, { recursive: true });
+}
+
+// Función envoltorio para sqlite3 con promesas
+class Database {
+    constructor(dbPath) {
+        this.db = new sqlite3.Database(dbPath, (err) => {
+            if (err) {
+                logger.error('Error abriendo la base de datos:', err);
+            } else {
+                logger.info('Conectado a SQLite en:', dbPath);
             }
-        }
-    } catch (err) {
-        console.warn('No se pudo crear directorio de datos:', err.message);
+        });
+    }
+
+    // Envolver run en promesa
+    run(sql, params = []) {
+        return new Promise((resolve, reject) => {
+            this.db.run(sql, params, function(err) {
+                if (err) {
+                    reject(err);
+                } else {
+                    resolve({ id: this.lastID, changes: this.changes });
+                }
+            });
+        });
+    }
+
+    // Envolver get en promesa
+    get(sql, params = []) {
+        return new Promise((resolve, reject) => {
+            this.db.get(sql, params, (err, row) => {
+                if (err) {
+                    reject(err);
+                } else {
+                    resolve(row);
+                }
+            });
+        });
+    }
+
+    // Envolver all en promesa
+    all(sql, params = []) {
+        return new Promise((resolve, reject) => {
+            this.db.all(sql, params, (err, rows) => {
+                if (err) {
+                    reject(err);
+                } else {
+                    resolve(rows);
+                }
+            });
+        });
+    }
+
+    // Cerrar conexión
+    close() {
+        return new Promise((resolve, reject) => {
+            this.db.close((err) => {
+                if (err) {
+                    reject(err);
+                } else {
+                    resolve();
+                }
+            });
+        });
     }
 }
 
@@ -77,8 +118,10 @@ if (!IS_RAILWAY) {
 let db;
 try {
     db = new Database(DB_PATH);
-    logger.info('Conectado a SQLite en:', DB_PATH);
-    initializeDatabase();
+    // Llamar a initializeDatabase de forma asíncrona
+    initializeDatabase().catch(err => {
+        logger.error('Error en inicialización asíncrona:', err);
+    });
 } catch (err) {
     logger.error('Error conectando a la base de datos:', err);
 }
@@ -193,35 +236,17 @@ const authenticateToken = (req, res, next) => {
     });
 };
 
-// Middleware de logging de requests mejorado
+// Middleware de logging de requests
 app.use((req, res, next) => {
-    const timestamp = new Date().toISOString();
     logger.info(`${req.method} ${req.path}`, { 
-        ip: req.ip,
-        userAgent: req.get('User-Agent'),
-        timestamp,
-        environment: NODE_ENV
+        ip: req.ip, 
+        userAgent: req.get('User-Agent') 
     });
     next();
 });
 
-// Middleware para capturar errores asíncronos
-app.use((req, res, next) => {
-    res.on('finish', () => {
-        if (res.statusCode >= 400) {
-            logger.warn(`HTTP ${res.statusCode} - ${req.method} ${req.path}`, {
-                statusCode: res.statusCode,
-                method: req.method,
-                path: req.path,
-                ip: req.ip
-            });
-        }
-    });
-    next();
-});
-
-// Función para inicializar la base de datos
-function initializeDatabase() {
+// Función para inicializar la base de datos (ahora asíncrona)
+async function initializeDatabase() {
     // Crear tablas si no existen
     const tables = [
         `CREATE TABLE IF NOT EXISTS users (
@@ -335,15 +360,25 @@ function initializeDatabase() {
         )`
     ];
 
-    tables.forEach(table => {
-        try {
-            db.exec(table);
-        } catch (err) {
-            logger.error('Error creando tabla:', err);
+    try {
+        for (const table of tables) {
+            await db.run(table);
         }
-    });
+        logger.info('Tablas creadas exitosamente');
+        
+        // Insertar usuarios iniciales si no existen
+        await insertInitialUsers();
+        
+        // Insertar productos iniciales de uniformes si no existen
+        await insertInitialUniformProducts();
+        
+    } catch (err) {
+        logger.error('Error inicializando base de datos:', err);
+    }
+}
 
-    // Insertar usuarios iniciales si no existen
+// Función para insertar usuarios iniciales
+async function insertInitialUsers() {
     const initialUsers = [
         ['admin', 'Administrador Principal', 'admin'],
         ['admin2', 'Administrador Secundario', 'admin'],
@@ -356,38 +391,56 @@ function initializeDatabase() {
         ['psi_laura', 'Laura Pérez', 'psicologa']
     ];
 
-    const insertUser = db.prepare('INSERT OR IGNORE INTO users (username, password, name, role) VALUES (?, ?, ?, ?)');
+    for (const [username, name, role] of initialUsers) {
+        try {
+            const hashedPassword = bcrypt.hashSync('password123', 10);
+            await db.run(
+                'INSERT OR IGNORE INTO users (username, password, name, role) VALUES (?, ?, ?, ?)',
+                [username, hashedPassword, name, role]
+            );
+        } catch (err) {
+            logger.error(`Error insertando usuario ${username}:`, err);
+        }
+    }
     
-    initialUsers.forEach(([username, name, role]) => {
-        const hashedPassword = bcrypt.hashSync('password123', 10);
-        insertUser.run(username, hashedPassword, name, role);
-    });
+    logger.info('Usuarios iniciales insertados');
+}
 
-    // Insertar productos iniciales de uniformes si no existen
+// Función para insertar productos iniciales de uniformes
+async function insertInitialUniformProducts() {
     const initialUniformProducts = [
         ['Poloche Blanco 4to/5to', 'Poloche blanco para niño / masculino', 'poloche', 450, 'img/blanco.m.jpeg', '4to/5to', 'M', JSON.stringify({S:10,M:8,L:5,XL:3}), 15],
         ['Poloche Blanco 4to/5to', 'Poloche blanco para niña / femenino', 'poloche', 450, 'img/blanco.f.jpeg', '4to/5to', 'F', JSON.stringify({S:8,M:10,L:6,XL:2}), 12],
         ['Poloche Azul con Rojo 6to', 'Poloche azul especial para grado 6to', 'poloche', 450, '', '6to', 'M', JSON.stringify({S:6,M:9,L:5,XL:3}), 10],
         ['Poloche Azul 6to', 'Poloche azul especial para grado 6to', 'poloche', 450, 'img/sola1.jpeg', '6to', 'F', JSON.stringify({S:7,M:8,L:4,XL:2}), 8],
-        ['Pantalón Azul 4to/5to/6to', 'Pantalón azul marino para niño', 'pantalon', 550, 'img/pantalon.m.jpeg', '4to/5to/6to', 'M', JSON.stringify({S:6,M:10,L:8,XL:4}), 12],
-        ['Pantalón Azul 4to/5to', 'Pantalón azul marino para femenina', 'pantalon', 550, 'img/pantalon.f.jpeg', '4to/5to/6to', 'F', JSON.stringify({S:8,M:7,L:5,XL:2}), 10],
-        ['Pantalón Deportivo 6to', 'Pantalón deportivo para Masculino y Femenino', 'deporte', 550, 'img/deporte.m.jpeg', '6to', 'M', JSON.stringify({S:5,M:9,L:7,XL:3}), 10],
-        ['Pantalón Deportivo 4to/5to', 'Pantalón deportivo para Feminina y Masculino', 'deporte', 550, 'img/deporte.f.jpeg', '4to/5to', 'F', JSON.stringify({S:6,M:8,L:5,XL:2}), 10],
-        ['Uniforme Deportivo Completo 4to/5to', 'Camiseta y pantalón deportivo completo', 'conjunto', 850, 'img/conjunto.jpeg', '4to/5to', 'U', JSON.stringify({S:5,M:8,L:6,XL:2}), 15],
-        ['Uniforme Deportivo Completo 4to/5to/6to', 'Camiseta y pantalón deportivo completo', 'conjunto', 850, 'img/conjunto2.jpeg', '4to/5to/6to', 'U', JSON.stringify({S:4,M:6,L:5,XL:1}), 12]
+        ['Pantalón Negro 4to/5to', 'Pantalón negro para niño / masculino', 'pantalon', 350, 'img/negro.m.jpeg', '4to/5to', 'M', JSON.stringify({S:8,M:10,L:6,XL:4}), 12],
+        ['Pantalón Negro 4to/5to', 'Pantalón negro para niña / femenino', 'pantalon', 350, 'img/negro.f.jpeg', '4to/5to', 'F', JSON.stringify({S:6,M:9,L:7,XL:3}), 10],
+        ['Pantalón Negro 6to', 'Pantalón negro especial para grado 6to', 'pantalon', 350, '', '6to', 'M', JSON.stringify({S:5,M:8,L:6,XL:3}), 8],
+        ['Pantalón Negro 6to', 'Pantalón negro especial para grado 6to', 'pantalon', 350, 'img/pantalon1.jpeg', '6to', 'F', JSON.stringify({S:4,M:7,L:5,XL:2}), 6],
+        ['Conjunto Deporte 4to/5to', 'Conjunto deportivo para niño / masculino', 'deporte', 500, 'img/deporte.m.jpeg', '4to/5to', 'M', JSON.stringify({S:6,M:8,L:4,XL:2}), 8],
+        ['Conjunto Deporte 4to/5to', 'Conjunto deportivo para niña / femenino', 'deporte', 500, 'img/deporte.f.jpeg', '4to/5to', 'F', JSON.stringify({S:5,M:7,L:5,XL:2}), 7],
+        ['Conjunto Deporte 6to', 'Conjunto deportivo especial para grado 6to', 'deporte', 500, '', '6to', 'M', JSON.stringify({S:4,M:6,L:4,XL:2}), 6],
+        ['Conjunto Deporte 6to', 'Conjunto deportivo especial para grado 6to', 'deporte', 500, 'img/conjunto1.jpeg', '6to', 'F', JSON.stringify({S:3,M:5,L:3,XL:1}), 5]
     ];
 
-    const insertProduct = db.prepare('INSERT OR IGNORE INTO uniform_products (name, description, category, price, image, grade, gender, sizes, stock) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)');
+    for (const [name, description, category, price, image, grade, gender, sizes, stock] of initialUniformProducts) {
+        try {
+            await db.run(
+                'INSERT OR IGNORE INTO uniform_products (name, description, category, price, image, grade, gender, sizes, stock) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)',
+                [name, description, category, price, image, grade, gender, sizes, stock]
+            );
+        } catch (err) {
+            logger.error(`Error insertando producto ${name}:`, err);
+        }
+    }
     
-    initialUniformProducts.forEach(([name, description, category, price, image, grade, gender, sizes, stock]) => {
-        insertProduct.run(name, description, category, price, image, grade, gender, sizes, stock);
-    });
-
-    logger.info('Base de datos inicializada');
+    logger.info('Productos iniciales de uniformes insertados');
 }
 
+logger.info('Base de datos inicializada');
+
 // Rutas de autenticación
-app.post('/api/auth/login', (req, res) => {
+app.post('/api/auth/login', async (req, res) => {
     try {
         const { username, password } = req.body;
         
@@ -395,46 +448,41 @@ app.post('/api/auth/login', (req, res) => {
             return res.status(400).json({ error: 'Usuario y contraseña requeridos' });
         }
 
-        db.get(
+        const user = await db.get(
             'SELECT * FROM users WHERE username = ?',
-            [username],
-            (err, user) => {
-                if (err) {
-                    logger.error('Error en login:', err);
-                    return res.status(500).json({ error: 'Error del servidor' });
-                }
-
-                if (!user) {
-                    return res.status(401).json({ error: 'Credenciales inválidas' });
-                }
-
-                const passwordMatch = bcrypt.compareSync(password, user.password);
-                if (!passwordMatch) {
-                    return res.status(401).json({ error: 'Credenciales inválidas' });
-                }
-
-                const token = jwt.sign(
-                    { userId: user.id, username: user.username, role: user.role, name: user.name },
-                    JWT_SECRET,
-                    { expiresIn: '24h' }
-                );
-
-                logger.info(`Usuario ${username} inició sesión`);
-                
-                res.json({
-                    success: true,
-                    token,
-                    user: {
-                        id: user.id,
-                        username: user.username,
-                        name: user.name,
-                        role: user.role
-                    }
-                });
-            }
+            [username]
         );
-    } catch (error) {
-        logger.error('Error en login:', error);
+
+        if (!user) {
+            return res.status(401).json({ error: 'Credenciales inválidas' });
+        }
+
+        const passwordMatch = bcrypt.compareSync(password, user.password);
+        if (!passwordMatch) {
+            return res.status(401).json({ error: 'Credenciales inválidas' });
+        }
+
+        const token = jwt.sign(
+            { userId: user.id, username: user.username, role: user.role, name: user.name },
+            JWT_SECRET,
+            { expiresIn: '24h' }
+        );
+
+        logger.info(`Usuario ${username} inició sesión`);
+        
+        res.json({
+            success: true,
+            token,
+            user: {
+                id: user.id,
+                username: user.username,
+                name: user.name,
+                role: user.role
+            }
+        });
+
+    } catch (err) {
+        logger.error('Error en login:', err);
         res.status(500).json({ error: 'Error del servidor' });
     }
 });
@@ -444,33 +492,33 @@ app.post('/api/auth/validate', authenticateToken, (req, res) => {
 });
 
 // Rutas de excusas
-app.get('/api/excuses', authenticateToken, (req, res) => {
-    const { role, username } = req.user;
-    
-    let query = 'SELECT * FROM excuses';
-    let params = [];
-    
-    if (role === 'docente') {
-        query += ' WHERE professorUsername = ?';
-        params = [username];
-    } else if (role === 'psicologa') {
-        query += ' WHERE psychologistUsername = ?';
-        params = [username];
-    }
-    
-    query += ' ORDER BY createdAt DESC';
-    
-    db.all(query, params, (err, rows) => {
-        if (err) {
-            logger.error('Error obteniendo excusas:', err);
-            return res.status(500).json({ error: 'Error del servidor' });
+app.get('/api/excuses', authenticateToken, async (req, res) => {
+    try {
+        const { role, username } = req.user;
+        
+        let query = 'SELECT * FROM excuses';
+        let params = [];
+        
+        if (role === 'docente') {
+            query += ' WHERE professorUsername = ?';
+            params = [username];
+        } else if (role === 'psicologa') {
+            query += ' WHERE psychologistUsername = ?';
+            params = [username];
         }
         
+        query += ' ORDER BY createdAt DESC';
+        
+        const rows = await db.all(query, params);
         res.json(rows);
-    });
+        
+    } catch (err) {
+        logger.error('Error obteniendo excusas:', err);
+        res.status(500).json({ error: 'Error del servidor' });
+    }
 });
 
-app.post('/api/excuses', authenticateToken, (req, res) => {
+app.post('/api/excuses', authenticateToken, async (req, res) => {
     try {
         const { error, value } = schemas.excuse.validate(req.body);
         if (error) {
@@ -480,19 +528,14 @@ app.post('/api/excuses', authenticateToken, (req, res) => {
         const { studentName, course, psychologistUsername, reason, type } = value;
         const professorUsername = req.user.username;
 
-        db.run(
+        const result = await db.run(
             'INSERT INTO excuses (studentName, course, psychologistUsername, reason, type, professorUsername) VALUES (?, ?, ?, ?, ?, ?)',
-            [studentName, course, psychologistUsername, reason, type, professorUsername],
-            function(err) {
-                if (err) {
-                    logger.error('Error creando excusa:', err);
-                    return res.status(500).json({ error: 'Error del servidor' });
-                }
-                
-                logger.info(`Excusa creada por ${professorUsername} para ${studentName}`);
-                res.json({ success: true, id: this.lastID });
-            }
+            [studentName, course, psychologistUsername, reason, type, professorUsername]
         );
+        
+        logger.info(`Excusa creada por ${professorUsername} para ${studentName}`);
+        res.json({ success: true, id: result.id });
+        
     } catch (error) {
         logger.error('Error creando excusa:', error);
         res.status(500).json({ error: 'Error del servidor' });
@@ -500,33 +543,33 @@ app.post('/api/excuses', authenticateToken, (req, res) => {
 });
 
 // Rutas de mensajes
-app.get('/api/messages', authenticateToken, (req, res) => {
-    const { role, username } = req.user;
-    
-    let query = 'SELECT * FROM messages';
-    let params = [];
-    
-    if (role === 'docente') {
-        query += ' WHERE sender = ? OR recipient = ?';
-        params = [username, username];
-    } else if (role === 'psicologa') {
-        query += ' WHERE sender = ? OR recipient = ?';
-        params = [username, username];
-    }
-    
-    query += ' ORDER BY createdAt DESC';
-    
-    db.all(query, params, (err, rows) => {
-        if (err) {
-            logger.error('Error obteniendo mensajes:', err);
-            return res.status(500).json({ error: 'Error del servidor' });
+app.get('/api/messages', authenticateToken, async (req, res) => {
+    try {
+        const { role, username } = req.user;
+        
+        let query = 'SELECT * FROM messages';
+        let params = [];
+        
+        if (role === 'docente') {
+            query += ' WHERE sender = ? OR recipient = ?';
+            params = [username, username];
+        } else if (role === 'psicologa') {
+            query += ' WHERE sender = ? OR recipient = ?';
+            params = [username, username];
         }
         
+        query += ' ORDER BY createdAt DESC';
+        
+        const rows = await db.all(query, params);
         res.json(rows);
-    });
+        
+    } catch (err) {
+        logger.error('Error obteniendo mensajes:', err);
+        res.status(500).json({ error: 'Error del servidor' });
+    }
 });
 
-app.post('/api/messages', authenticateToken, (req, res) => {
+app.post('/api/messages', authenticateToken, async (req, res) => {
     try {
         const { error, value } = schemas.message.validate(req.body);
         if (error) {
@@ -535,19 +578,14 @@ app.post('/api/messages', authenticateToken, (req, res) => {
 
         const { sender, recipient, subject, content } = value;
 
-        db.run(
+        const result = await db.run(
             'INSERT INTO messages (sender, recipient, subject, content) VALUES (?, ?, ?, ?)',
-            [sender, recipient, subject, content],
-            function(err) {
-                if (err) {
-                    logger.error('Error creando mensaje:', err);
-                    return res.status(500).json({ error: 'Error del servidor' });
-                }
-                
-                logger.info(`Mensaje de ${sender} para ${recipient}`);
-                res.json({ success: true, id: this.lastID });
-            }
+            [sender, recipient, subject, content]
         );
+        
+        logger.info(`Mensaje de ${sender} para ${recipient}`);
+        res.json({ success: true, id: result.id });
+        
     } catch (error) {
         logger.error('Error creando mensaje:', error);
         res.status(500).json({ error: 'Error del servidor' });
@@ -555,24 +593,24 @@ app.post('/api/messages', authenticateToken, (req, res) => {
 });
 
 // Rutas de asistencia
-app.get('/api/attendance', authenticateToken, (req, res) => {
-    const { username } = req.user;
-    
-    db.all(
-        'SELECT * FROM attendance WHERE professorUsername = ? ORDER BY date DESC',
-        [username],
-        (err, rows) => {
-            if (err) {
-                logger.error('Error obteniendo asistencia:', err);
-                return res.status(500).json({ error: 'Error del servidor' });
-            }
-            
-            res.json(rows);
-        }
-    );
+app.get('/api/attendance', authenticateToken, async (req, res) => {
+    try {
+        const { username } = req.user;
+        
+        const rows = await db.all(
+            'SELECT * FROM attendance WHERE professorUsername = ? ORDER BY date DESC',
+            [username]
+        );
+        
+        res.json(rows);
+        
+    } catch (err) {
+        logger.error('Error obteniendo asistencia:', err);
+        res.status(500).json({ error: 'Error del servidor' });
+    }
 });
 
-app.post('/api/attendance', authenticateToken, (req, res) => {
+app.post('/api/attendance', authenticateToken, async (req, res) => {
     try {
         const { error, value } = schemas.attendance.validate(req.body);
         if (error) {
@@ -582,19 +620,14 @@ app.post('/api/attendance', authenticateToken, (req, res) => {
         const { course, date, presentStudents, absentStudents, totalStudents } = value;
         const professorUsername = req.user.username;
 
-        db.run(
+        const result = await db.run(
             'INSERT INTO attendance (course, date, presentStudents, absentStudents, totalStudents, professorUsername) VALUES (?, ?, ?, ?, ?, ?)',
-            [course, date, JSON.stringify(presentStudents), JSON.stringify(absentStudents), totalStudents, professorUsername],
-            function(err) {
-                if (err) {
-                    logger.error('Error creando asistencia:', err);
-                    return res.status(500).json({ error: 'Error del servidor' });
-                }
-                
-                logger.info(`Asistencia registrada por ${professorUsername} para ${course}`);
-                res.json({ success: true, id: this.lastID });
-            }
+            [course, date, JSON.stringify(presentStudents), JSON.stringify(absentStudents), totalStudents, professorUsername]
         );
+        
+        logger.info(`Asistencia registrada por ${professorUsername} para ${course}`);
+        res.json({ success: true, id: result.id });
+        
     } catch (error) {
         logger.error('Error creando asistencia:', error);
         res.status(500).json({ error: 'Error del servidor' });
@@ -1011,71 +1044,34 @@ app.get('/api/uniforms/stats', authenticateToken, (req, res) => {
 });
 
 // Endpoint de salud
-app.get('/api/health', (req, res) => {
-    db.get('SELECT COUNT(*) as count FROM users', (err, row) => {
+app.get('/api/health', async (req, res) => {
+    try {
+        const row = await db.get('SELECT COUNT(*) as count FROM users');
         res.json({
             status: 'healthy',
             timestamp: new Date().toISOString(),
             database: 'connected',
             users: row ? row.count : 0
         });
-    });
-});
-
-// Manejo de errores 404 mejorado
-app.use((req, res) => {
-    logger.warn('Endpoint no encontrado', {
-        method: req.method,
-        path: req.path,
-        ip: req.ip,
-        userAgent: req.get('User-Agent')
-    });
-    res.status(404).json({ 
-        error: 'Endpoint no encontrado',
-        path: req.path,
-        method: req.method
-    });
-});
-
-// Manejo de errores globales mejorado para producción
-app.use((err, req, res, next) => {
-    // Log completo del error
-    logger.error('Error no manejado:', {
-        message: err.message,
-        stack: err.stack,
-        method: req.method,
-        path: req.path,
-        ip: req.ip,
-        userAgent: req.get('User-Agent'),
-        body: req.body,
-        params: req.params,
-        query: req.query,
-        environment: NODE_ENV,
-        isRailway: IS_RAILWAY
-    });
-
-    // Respuesta diferenciada para producción vs desarrollo
-    if (IS_RAILWAY) {
-        // En producción: mensaje genérico pero con código de error
-        res.status(500).json({ 
-            error: 'Error interno del servidor',
-            code: 'INTERNAL_ERROR',
+    } catch (err) {
+        res.status(500).json({
+            status: 'unhealthy',
             timestamp: new Date().toISOString(),
-            requestId: Math.random().toString(36).substr(2, 9)
-        });
-    } else {
-        // En desarrollo: mostrar detalles completos
-        res.status(500).json({ 
-            error: 'Error interno del servidor',
-            message: err.message,
-            stack: err.stack,
-            details: {
-                method: req.method,
-                path: req.path,
-                body: req.body
-            }
+            database: 'disconnected',
+            error: err.message
         });
     }
+});
+
+// Manejo de errores 404
+app.use((req, res) => {
+    res.status(404).json({ error: 'Endpoint no encontrado' });
+});
+
+// Manejo de errores globales
+app.use((err, req, res, next) => {
+    logger.error('Error no manejado:', err);
+    res.status(500).json({ error: 'Error interno del servidor' });
 });
 
 // Iniciar servidor
